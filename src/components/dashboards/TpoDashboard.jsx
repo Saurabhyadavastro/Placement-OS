@@ -39,6 +39,30 @@ function TpoDashboard({ session, profile }) {
   const [selectedApplication, setSelectedApplication] = useState(null)
   const [statusUpdateLoading, setStatusUpdateLoading] = useState({})
 
+  // Student Management States
+  const [students, setStudents] = useState([])
+  const [studentsLoading, setStudentsLoading] = useState(false)
+  const [selectedStudent, setSelectedStudent] = useState(null)
+  const [studentForm, setStudentForm] = useState({
+    email: '',
+    full_name: '',
+    department: '',
+    graduation_year: '',
+    phone: '',
+    skills: []
+  })
+  const [studentSkillInput, setStudentSkillInput] = useState('')
+  const [bulkUploadFile, setBulkUploadFile] = useState(null)
+  const [uploadProgress, setUploadProgress] = useState(0)
+  const [isUploading, setIsUploading] = useState(false)
+
+  // File Upload States
+  const [uploadedFiles, setUploadedFiles] = useState([])
+  const [filesLoading, setFilesLoading] = useState(false)
+  const [selectedFile, setSelectedFile] = useState(null)
+  const [fileCategory, setFileCategory] = useState('placement-docs')
+  const [fileDescription, setFileDescription] = useState('')
+
   useEffect(() => {
     if (activeTab === 'jobs' || activeTab === 'verification') {
       fetchOpportunities()
@@ -46,6 +70,10 @@ function TpoDashboard({ session, profile }) {
       fetchAnalytics()
     } else if (activeTab === 'applications') {
       fetchAllApplications()
+    } else if (activeTab === 'students') {
+      fetchStudents()
+    } else if (activeTab === 'files') {
+      fetchFiles()
     }
   }, [activeTab])
 
@@ -352,6 +380,334 @@ function TpoDashboard({ session, profile }) {
     })
   }
 
+  // Student Management Functions
+  const fetchStudents = async () => {
+    try {
+      setStudentsLoading(true)
+      
+      // Fetch all student profiles with user data
+      const { data: profiles, error: profilesError } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('role', 'Student')
+        .order('created_at', { ascending: false })
+
+      if (profilesError) {
+        console.error('Error fetching student profiles:', profilesError)
+        setMessage('Error loading student profiles: ' + profilesError.message)
+        return
+      }
+
+      // Fetch student_profiles data
+      const studentIds = profiles?.map(p => p.id) || []
+      const { data: studentProfiles, error: studentProfilesError } = await supabase
+        .from('student_profiles')
+        .select('*')
+        .in('user_id', studentIds)
+
+      if (studentProfilesError) {
+        console.error('Error fetching student details:', studentProfilesError)
+      }
+
+      // Merge the data
+      const enrichedStudents = profiles?.map(profile => ({
+        ...profile,
+        student_profile: studentProfiles?.find(sp => sp.user_id === profile.id) || null
+      })) || []
+
+      setStudents(enrichedStudents)
+    } catch (error) {
+      console.error('Error:', error)
+      setMessage('Error loading students: ' + error.message)
+    } finally {
+      setStudentsLoading(false)
+    }
+  }
+
+  const handleStudentSubmit = async (e) => {
+    e.preventDefault()
+    setLoading(true)
+    setMessage('')
+
+    try {
+      // First, create the user account
+      const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+        email: studentForm.email,
+        password: 'TempPassword123!', // Temporary password
+        email_confirm: true
+      })
+
+      if (authError) {
+        setMessage('Error creating student account: ' + authError.message)
+        return
+      }
+
+      // Create profile
+      const { error: profileError } = await supabase
+        .from('profiles')
+        .insert([{
+          id: authData.user.id,
+          email: studentForm.email,
+          role: 'Student',
+          created_at: new Date().toISOString()
+        }])
+
+      if (profileError) {
+        setMessage('Error creating student profile: ' + profileError.message)
+        return
+      }
+
+      // Create student profile
+      const { error: studentProfileError } = await supabase
+        .from('student_profiles')
+        .insert([{
+          user_id: authData.user.id,
+          full_name: studentForm.full_name,
+          department: studentForm.department,
+          graduation_year: parseInt(studentForm.graduation_year),
+          phone: studentForm.phone,
+          skills: studentForm.skills
+        }])
+
+      if (studentProfileError) {
+        setMessage('Error creating student details: ' + studentProfileError.message)
+        return
+      }
+
+      setMessage(`Student ${studentForm.full_name} added successfully! Temporary password: TempPassword123!`)
+      setStudentForm({
+        email: '',
+        full_name: '',
+        department: '',
+        graduation_year: '',
+        phone: '',
+        skills: []
+      })
+      fetchStudents()
+    } catch (error) {
+      setMessage('Error adding student: ' + error.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const addStudentSkill = () => {
+    if (studentSkillInput.trim() && !studentForm.skills.includes(studentSkillInput.trim())) {
+      setStudentForm({
+        ...studentForm,
+        skills: [...studentForm.skills, studentSkillInput.trim()]
+      })
+      setStudentSkillInput('')
+    }
+  }
+
+  const removeStudentSkill = (skillToRemove) => {
+    setStudentForm({
+      ...studentForm,
+      skills: studentForm.skills.filter(skill => skill !== skillToRemove)
+    })
+  }
+
+  const handleBulkUpload = async (e) => {
+    const file = e.target.files[0]
+    if (!file) return
+
+    setBulkUploadFile(file)
+    setIsUploading(true)
+    setUploadProgress(0)
+
+    try {
+      const text = await file.text()
+      const lines = text.split('\n').filter(line => line.trim())
+      const header = lines[0].split(',').map(h => h.trim())
+      
+      // Validate CSV format
+      const requiredColumns = ['email', 'full_name', 'department', 'graduation_year']
+      const hasRequiredColumns = requiredColumns.every(col => 
+        header.some(h => h.toLowerCase().includes(col.toLowerCase()))
+      )
+
+      if (!hasRequiredColumns) {
+        setMessage('CSV must contain columns: email, full_name, department, graduation_year')
+        return
+      }
+
+      const students = []
+      for (let i = 1; i < lines.length; i++) {
+        const values = lines[i].split(',').map(v => v.trim())
+        if (values.length >= 4) {
+          const student = {
+            email: values[0],
+            full_name: values[1],
+            department: values[2],
+            graduation_year: values[3],
+            phone: values[4] || '',
+            skills: values[5] ? values[5].split(';').map(s => s.trim()) : []
+          }
+          students.push(student)
+        }
+        setUploadProgress((i / lines.length) * 100)
+      }
+
+      // Process students in batches
+      let successCount = 0
+      let errorCount = 0
+      
+      for (const student of students) {
+        try {
+          // Create user account
+          const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+            email: student.email,
+            password: 'TempPassword123!',
+            email_confirm: true
+          })
+
+          if (!authError && authData.user) {
+            // Create profile
+            await supabase.from('profiles').insert([{
+              id: authData.user.id,
+              email: student.email,
+              role: 'Student'
+            }])
+
+            // Create student profile
+            await supabase.from('student_profiles').insert([{
+              user_id: authData.user.id,
+              ...student,
+              graduation_year: parseInt(student.graduation_year)
+            }])
+            
+            successCount++
+          } else {
+            errorCount++
+          }
+        } catch (error) {
+          console.error('Error processing student:', error)
+          errorCount++
+        }
+      }
+
+      setMessage(`Bulk upload completed! ${successCount} students added successfully, ${errorCount} errors.`)
+      fetchStudents()
+    } catch (error) {
+      setMessage('Error processing CSV file: ' + error.message)
+    } finally {
+      setIsUploading(false)
+      setUploadProgress(0)
+      setBulkUploadFile(null)
+    }
+  }
+
+  // File Management Functions
+  const fetchFiles = async () => {
+    try {
+      setFilesLoading(true)
+      
+      const { data, error } = await supabase.storage
+        .from('placement-files')
+        .list('', {
+          limit: 100,
+          offset: 0
+        })
+
+      if (error) {
+        // If bucket doesn't exist, create it
+        if (error.message.includes('not found')) {
+          const { error: bucketError } = await supabase.storage
+            .createBucket('placement-files', {
+              public: true,
+              allowedMimeTypes: ['application/pdf', 'image/*', 'text/*', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document']
+            })
+          
+          if (bucketError) {
+            setMessage('Error creating storage bucket: ' + bucketError.message)
+          } else {
+            setUploadedFiles([])
+          }
+        } else {
+          setMessage('Error loading files: ' + error.message)
+        }
+      } else {
+        setUploadedFiles(data || [])
+      }
+    } catch (error) {
+      console.error('Error:', error)
+      setMessage('Error loading files: ' + error.message)
+    } finally {
+      setFilesLoading(false)
+    }
+  }
+
+  const handleFileUpload = async (e) => {
+    const file = e.target.files[0]
+    if (!file) return
+
+    setIsUploading(true)
+    setMessage('')
+
+    try {
+      const fileExt = file.name.split('.').pop()
+      const fileName = `${fileCategory}/${Date.now()}_${file.name}`
+
+      const { data, error } = await supabase.storage
+        .from('placement-files')
+        .upload(fileName, file)
+
+      if (error) {
+        setMessage('Error uploading file: ' + error.message)
+      } else {
+        setMessage(`File "${file.name}" uploaded successfully!`)
+        setSelectedFile(null)
+        setFileDescription('')
+        fetchFiles()
+      }
+    } catch (error) {
+      setMessage('Error uploading file: ' + error.message)
+    } finally {
+      setIsUploading(false)
+    }
+  }
+
+  const downloadFile = async (fileName) => {
+    try {
+      const { data, error } = await supabase.storage
+        .from('placement-files')
+        .download(fileName)
+
+      if (error) {
+        setMessage('Error downloading file: ' + error.message)
+      } else {
+        const url = URL.createObjectURL(data)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = fileName.split('/').pop()
+        a.click()
+        URL.revokeObjectURL(url)
+      }
+    } catch (error) {
+      setMessage('Error downloading file: ' + error.message)
+    }
+  }
+
+  const deleteFile = async (fileName) => {
+    if (!confirm('Are you sure you want to delete this file?')) return
+
+    try {
+      const { error } = await supabase.storage
+        .from('placement-files')
+        .remove([fileName])
+
+      if (error) {
+        setMessage('Error deleting file: ' + error.message)
+      } else {
+        setMessage('File deleted successfully!')
+        fetchFiles()
+      }
+    } catch (error) {
+      setMessage('Error deleting file: ' + error.message)
+    }
+  }
+
   const sidebarItems = [
     { id: 'overview', label: 'Analytics Dashboard', icon: '📊' },
     { id: 'applications', label: 'Application Tracking', icon: '📋' },
@@ -359,6 +715,7 @@ function TpoDashboard({ session, profile }) {
     { id: 'jobs', label: 'Post Opportunity', icon: '💼' },
     { id: 'companies', label: 'Company Relations', icon: '🏢' },
     { id: 'students', label: 'Student Management', icon: '👥' },
+    { id: 'files', label: 'File Management', icon: '📁' },
     { id: 'schedule', label: 'Interview Schedule', icon: '📅' },
     { id: 'reports', label: 'Placement Reports', icon: '📈' }
   ]
@@ -1136,12 +1493,657 @@ function TpoDashboard({ session, profile }) {
             {activeTab === 'students' && (
               <div>
                 <h1 className="text-3xl font-bold text-gray-900 mb-8">Student Management</h1>
-                <div className="bg-white rounded-lg shadow p-8 text-center">
-                  <div className="w-16 h-16 bg-gray-200 rounded-full mx-auto mb-4 flex items-center justify-center">
-                    <span className="text-2xl">👥</span>
+                
+                {/* Student Statistics */}
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
+                  <div className="bg-white p-6 rounded-lg shadow">
+                    <h3 className="text-lg font-semibold text-gray-700 mb-2">Total Students</h3>
+                    <p className="text-3xl font-bold text-blue-600">{students.length}</p>
                   </div>
-                  <h3 className="text-lg font-semibold text-gray-700 mb-2">Manage Student Records</h3>
-                  <p className="text-gray-500">Oversee student profiles, applications, and placement progress.</p>
+                  <div className="bg-white p-6 rounded-lg shadow">
+                    <h3 className="text-lg font-semibold text-gray-700 mb-2">Complete Profiles</h3>
+                    <p className="text-3xl font-bold text-green-600">
+                      {students.filter(s => s.student_profile).length}
+                    </p>
+                  </div>
+                  <div className="bg-white p-6 rounded-lg shadow">
+                    <h3 className="text-lg font-semibold text-gray-700 mb-2">Incomplete Profiles</h3>
+                    <p className="text-3xl font-bold text-orange-600">
+                      {students.filter(s => !s.student_profile).length}
+                    </p>
+                  </div>
+                  <div className="bg-white p-6 rounded-lg shadow">
+                    <h3 className="text-lg font-semibold text-gray-700 mb-2">Active Applications</h3>
+                    <p className="text-3xl font-bold text-purple-600">
+                      {allApplications.length}
+                    </p>
+                  </div>
+                </div>
+
+                {/* Action Tabs */}
+                <div className="bg-white rounded-lg shadow mb-6">
+                  <div className="border-b border-gray-200">
+                    <nav className="-mb-px flex space-x-8 px-6">
+                      {['view-students', 'add-student', 'bulk-upload'].map((tab) => (
+                        <button
+                          key={tab}
+                          onClick={() => setActiveTab(`students-${tab}`)}
+                          className={`py-4 px-1 border-b-2 font-medium text-sm ${
+                            activeTab === `students-${tab}`
+                              ? 'border-purple-500 text-purple-600'
+                              : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+                          }`}
+                        >
+                          {tab === 'view-students' && '👥 View Students'}
+                          {tab === 'add-student' && '➕ Add Student'}
+                          {tab === 'bulk-upload' && '📤 Bulk Upload'}
+                        </button>
+                      ))}
+                    </nav>
+                  </div>
+                </div>
+
+                {/* Student List */}
+                {(activeTab === 'students' || activeTab === 'students-view-students') && (
+                  <div>
+                    {studentsLoading ? (
+                      <div className="flex justify-center py-8">
+                        <div className="animate-spin rounded-full h-32 w-32 border-b-2 border-purple-500"></div>
+                      </div>
+                    ) : students.length === 0 ? (
+                      <div className="bg-white rounded-lg shadow p-8 text-center">
+                        <div className="w-16 h-16 bg-gray-200 rounded-full mx-auto mb-4 flex items-center justify-center">
+                          <span className="text-2xl">👥</span>
+                        </div>
+                        <h3 className="text-lg font-semibold text-gray-700 mb-2">No Students Found</h3>
+                        <p className="text-gray-500 mb-4">Start by adding students to the system.</p>
+                        <button
+                          onClick={() => setActiveTab('students-add-student')}
+                          className="bg-purple-500 text-white px-6 py-2 rounded-md hover:bg-purple-600"
+                        >
+                          Add First Student
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="bg-white rounded-lg shadow overflow-hidden">
+                        <div className="px-6 py-4 bg-gray-50 border-b">
+                          <h2 className="text-lg font-semibold text-gray-800">All Students ({students.length})</h2>
+                        </div>
+                        <div className="overflow-x-auto">
+                          <table className="min-w-full divide-y divide-gray-200">
+                            <thead className="bg-gray-50">
+                              <tr>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Student</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Department</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Graduation Year</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Skills</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Profile Status</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                              </tr>
+                            </thead>
+                            <tbody className="bg-white divide-y divide-gray-200">
+                              {students.map((student) => (
+                                <tr key={student.id} className="hover:bg-gray-50">
+                                  <td className="px-6 py-4 whitespace-nowrap">
+                                    <div>
+                                      <div className="text-sm font-medium text-gray-900">
+                                        {student.student_profile?.full_name || 'No Name'}
+                                      </div>
+                                      <div className="text-sm text-gray-500">{student.email}</div>
+                                    </div>
+                                  </td>
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                                    {student.student_profile?.department || 'Not Set'}
+                                  </td>
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                                    {student.student_profile?.graduation_year || 'Not Set'}
+                                  </td>
+                                  <td className="px-6 py-4">
+                                    <div className="flex flex-wrap gap-1">
+                                      {student.student_profile?.skills?.slice(0, 3).map((skill, index) => (
+                                        <span key={index} className="bg-blue-100 text-blue-800 px-2 py-1 rounded text-xs">
+                                          {skill}
+                                        </span>
+                                      ))}
+                                      {student.student_profile?.skills?.length > 3 && (
+                                        <span className="bg-gray-100 text-gray-600 px-2 py-1 rounded text-xs">
+                                          +{student.student_profile.skills.length - 3}
+                                        </span>
+                                      )}
+                                    </div>
+                                  </td>
+                                  <td className="px-6 py-4 whitespace-nowrap">
+                                    <span className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
+                                      student.student_profile
+                                        ? 'bg-green-100 text-green-800'
+                                        : 'bg-red-100 text-red-800'
+                                    }`}>
+                                      {student.student_profile ? 'Complete' : 'Incomplete'}
+                                    </span>
+                                  </td>
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm">
+                                    <button
+                                      onClick={() => setSelectedStudent(student)}
+                                      className="text-purple-600 hover:text-purple-900 mr-3"
+                                    >
+                                      View Details
+                                    </button>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Add Student Form */}
+                {activeTab === 'students-add-student' && (
+                  <div className="bg-white rounded-lg shadow p-6">
+                    <h2 className="text-xl font-bold text-gray-900 mb-6">Add New Student</h2>
+                    
+                    <form onSubmit={handleStudentSubmit} className="space-y-6">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Email Address *
+                          </label>
+                          <input
+                            type="email"
+                            required
+                            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-purple-500 focus:border-purple-500"
+                            value={studentForm.email}
+                            onChange={(e) => setStudentForm({
+                              ...studentForm,
+                              email: e.target.value
+                            })}
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Full Name *
+                          </label>
+                          <input
+                            type="text"
+                            required
+                            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-purple-500 focus:border-purple-500"
+                            value={studentForm.full_name}
+                            onChange={(e) => setStudentForm({
+                              ...studentForm,
+                              full_name: e.target.value
+                            })}
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Department *
+                          </label>
+                          <select
+                            required
+                            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-purple-500 focus:border-purple-500"
+                            value={studentForm.department}
+                            onChange={(e) => setStudentForm({
+                              ...studentForm,
+                              department: e.target.value
+                            })}
+                          >
+                            <option value="">Select Department</option>
+                            <option value="Computer Science">Computer Science</option>
+                            <option value="Information Technology">Information Technology</option>
+                            <option value="Electronics & Communication">Electronics & Communication</option>
+                            <option value="Mechanical Engineering">Mechanical Engineering</option>
+                            <option value="Civil Engineering">Civil Engineering</option>
+                            <option value="Electrical Engineering">Electrical Engineering</option>
+                            <option value="Business Administration">Business Administration</option>
+                            <option value="Other">Other</option>
+                          </select>
+                        </div>
+
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Graduation Year *
+                          </label>
+                          <input
+                            type="number"
+                            required
+                            min="2020"
+                            max="2030"
+                            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-purple-500 focus:border-purple-500"
+                            value={studentForm.graduation_year}
+                            onChange={(e) => setStudentForm({
+                              ...studentForm,
+                              graduation_year: e.target.value
+                            })}
+                          />
+                        </div>
+
+                        <div className="md:col-span-2">
+                          <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Phone Number
+                          </label>
+                          <input
+                            type="tel"
+                            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-purple-500 focus:border-purple-500"
+                            value={studentForm.phone}
+                            onChange={(e) => setStudentForm({
+                              ...studentForm,
+                              phone: e.target.value
+                            })}
+                          />
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                          Skills
+                        </label>
+                        <div className="flex gap-2 mb-3">
+                          <input
+                            type="text"
+                            placeholder="Add a skill"
+                            className="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-purple-500 focus:border-purple-500"
+                            value={studentSkillInput}
+                            onChange={(e) => setStudentSkillInput(e.target.value)}
+                            onKeyPress={(e) => e.key === 'Enter' && (e.preventDefault(), addStudentSkill())}
+                          />
+                          <button
+                            type="button"
+                            onClick={addStudentSkill}
+                            className="px-4 py-2 bg-purple-500 text-white rounded-md hover:bg-purple-600"
+                          >
+                            Add
+                          </button>
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          {studentForm.skills.map((skill, index) => (
+                            <span
+                              key={index}
+                              className="inline-flex items-center px-3 py-1 bg-purple-100 text-purple-800 rounded-full text-sm"
+                            >
+                              {skill}
+                              <button
+                                type="button"
+                                onClick={() => removeStudentSkill(skill)}
+                                className="ml-2 text-purple-600 hover:text-purple-800"
+                              >
+                                ×
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="flex justify-end space-x-4">
+                        <button
+                          type="button"
+                          onClick={() => setActiveTab('students')}
+                          className="px-6 py-3 border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="submit"
+                          disabled={loading}
+                          className="px-6 py-3 bg-purple-500 text-white rounded-md hover:bg-purple-600 disabled:opacity-50"
+                        >
+                          {loading ? 'Adding Student...' : 'Add Student'}
+                        </button>
+                      </div>
+                    </form>
+                  </div>
+                )}
+
+                {/* Bulk Upload */}
+                {activeTab === 'students-bulk-upload' && (
+                  <div className="bg-white rounded-lg shadow p-6">
+                    <h2 className="text-xl font-bold text-gray-900 mb-6">Bulk Upload Students</h2>
+                    
+                    <div className="space-y-6">
+                      {/* Instructions */}
+                      <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                        <h3 className="font-semibold text-blue-800 mb-2">📋 CSV Format Instructions</h3>
+                        <div className="text-sm text-blue-700 space-y-1">
+                          <p><strong>Required columns:</strong> email, full_name, department, graduation_year</p>
+                          <p><strong>Optional columns:</strong> phone, skills (semicolon-separated)</p>
+                          <p><strong>Example:</strong> john@email.com, John Doe, Computer Science, 2024, +1234567890, JavaScript;React;Node.js</p>
+                        </div>
+                      </div>
+
+                      {/* File Upload */}
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                          Upload CSV File
+                        </label>
+                        <input
+                          type="file"
+                          accept=".csv"
+                          onChange={handleBulkUpload}
+                          disabled={isUploading}
+                          className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-purple-500 focus:border-purple-500"
+                        />
+                      </div>
+
+                      {/* Upload Progress */}
+                      {isUploading && (
+                        <div>
+                          <div className="flex justify-between text-sm text-gray-600 mb-2">
+                            <span>Processing students...</span>
+                            <span>{Math.round(uploadProgress)}%</span>
+                          </div>
+                          <div className="w-full bg-gray-200 rounded-full h-2">
+                            <div
+                              className="bg-purple-500 h-2 rounded-full transition-all"
+                              style={{ width: `${uploadProgress}%` }}
+                            ></div>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Sample CSV Download */}
+                      <div className="flex justify-between items-center">
+                        <button
+                          onClick={() => {
+                            const csv = "email,full_name,department,graduation_year,phone,skills\njohn.doe@email.com,John Doe,Computer Science,2024,+1234567890,JavaScript;React;Node.js\njane.smith@email.com,Jane Smith,Information Technology,2025,+0987654321,Python;Django;SQL"
+                            const blob = new Blob([csv], { type: 'text/csv' })
+                            const url = URL.createObjectURL(blob)
+                            const a = document.createElement('a')
+                            a.href = url
+                            a.download = 'sample_students.csv'
+                            a.click()
+                            URL.revokeObjectURL(url)
+                          }}
+                          className="text-purple-600 hover:text-purple-800 underline"
+                        >
+                          📥 Download Sample CSV
+                        </button>
+                        <button
+                          onClick={() => setActiveTab('students')}
+                          className="px-6 py-3 border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50"
+                        >
+                          Back to Students
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Student Detail Modal */}
+                {selectedStudent && (
+                  <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+                    <div className="bg-white rounded-lg p-6 max-w-2xl max-h-[90vh] overflow-y-auto w-full mx-4">
+                      <div className="flex justify-between items-start mb-6">
+                        <h2 className="text-2xl font-bold text-gray-900">Student Details</h2>
+                        <button
+                          onClick={() => setSelectedStudent(null)}
+                          className="text-gray-500 hover:text-gray-700 text-2xl"
+                        >
+                          ×
+                        </button>
+                      </div>
+
+                      <div className="space-y-4">
+                        <div className="grid grid-cols-2 gap-4">
+                          <div>
+                            <p className="text-sm text-gray-600">Email</p>
+                            <p className="font-medium">{selectedStudent.email}</p>
+                          </div>
+                          <div>
+                            <p className="text-sm text-gray-600">Full Name</p>
+                            <p className="font-medium">{selectedStudent.student_profile?.full_name || 'Not provided'}</p>
+                          </div>
+                          <div>
+                            <p className="text-sm text-gray-600">Department</p>
+                            <p className="font-medium">{selectedStudent.student_profile?.department || 'Not provided'}</p>
+                          </div>
+                          <div>
+                            <p className="text-sm text-gray-600">Graduation Year</p>
+                            <p className="font-medium">{selectedStudent.student_profile?.graduation_year || 'Not provided'}</p>
+                          </div>
+                          {selectedStudent.student_profile?.phone && (
+                            <div>
+                              <p className="text-sm text-gray-600">Phone</p>
+                              <p className="font-medium">{selectedStudent.student_profile.phone}</p>
+                            </div>
+                          )}
+                        </div>
+
+                        {selectedStudent.student_profile?.skills && selectedStudent.student_profile.skills.length > 0 && (
+                          <div>
+                            <p className="text-sm text-gray-600 mb-2">Skills</p>
+                            <div className="flex flex-wrap gap-2">
+                              {selectedStudent.student_profile.skills.map((skill, index) => (
+                                <span key={index} className="bg-blue-100 text-blue-800 px-3 py-1 rounded-full text-sm">
+                                  {skill}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        <div>
+                          <p className="text-sm text-gray-600">Account Created</p>
+                          <p className="font-medium">{new Date(selectedStudent.created_at).toLocaleDateString()}</p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {activeTab === 'files' && (
+              <div>
+                <h1 className="text-3xl font-bold text-gray-900 mb-8">File Management</h1>
+                
+                {/* File Statistics */}
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
+                  <div className="bg-white p-6 rounded-lg shadow">
+                    <h3 className="text-lg font-semibold text-gray-700 mb-2">Total Files</h3>
+                    <p className="text-3xl font-bold text-blue-600">{uploadedFiles.length}</p>
+                  </div>
+                  <div className="bg-white p-6 rounded-lg shadow">
+                    <h3 className="text-lg font-semibold text-gray-700 mb-2">Documents</h3>
+                    <p className="text-3xl font-bold text-green-600">
+                      {uploadedFiles.filter(f => f.name.includes('placement-docs')).length}
+                    </p>
+                  </div>
+                  <div className="bg-white p-6 rounded-lg shadow">
+                    <h3 className="text-lg font-semibold text-gray-700 mb-2">Templates</h3>
+                    <p className="text-3xl font-bold text-purple-600">
+                      {uploadedFiles.filter(f => f.name.includes('templates')).length}
+                    </p>
+                  </div>
+                  <div className="bg-white p-6 rounded-lg shadow">
+                    <h3 className="text-lg font-semibold text-gray-700 mb-2">Reports</h3>
+                    <p className="text-3xl font-bold text-orange-600">
+                      {uploadedFiles.filter(f => f.name.includes('reports')).length}
+                    </p>
+                  </div>
+                </div>
+
+                {/* File Upload Form */}
+                <div className="bg-white rounded-lg shadow p-6 mb-8">
+                  <h2 className="text-xl font-bold text-gray-900 mb-6">Upload New File</h2>
+                  
+                  <div className="space-y-4">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                          File Category
+                        </label>
+                        <select
+                          value={fileCategory}
+                          onChange={(e) => setFileCategory(e.target.value)}
+                          className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-purple-500 focus:border-purple-500"
+                        >
+                          <option value="placement-docs">Placement Documents</option>
+                          <option value="templates">Templates</option>
+                          <option value="reports">Reports</option>
+                          <option value="guidelines">Guidelines</option>
+                          <option value="company-info">Company Information</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                          File Description
+                        </label>
+                        <input
+                          type="text"
+                          value={fileDescription}
+                          onChange={(e) => setFileDescription(e.target.value)}
+                          placeholder="Brief description of the file"
+                          className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-purple-500 focus:border-purple-500"
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">
+                        Select File
+                      </label>
+                      <input
+                        type="file"
+                        onChange={handleFileUpload}
+                        disabled={isUploading}
+                        accept=".pdf,.doc,.docx,.txt,.jpg,.jpeg,.png,.gif,.xlsx,.pptx"
+                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-purple-500 focus:border-purple-500"
+                      />
+                      <p className="text-sm text-gray-500 mt-1">
+                        Supported formats: PDF, DOC, DOCX, TXT, Images, Excel, PowerPoint
+                      </p>
+                    </div>
+
+                    {isUploading && (
+                      <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                        <div className="flex items-center">
+                          <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-500 mr-3"></div>
+                          <span className="text-blue-700">Uploading file...</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Files List */}
+                {filesLoading ? (
+                  <div className="flex justify-center py-8">
+                    <div className="animate-spin rounded-full h-32 w-32 border-b-2 border-purple-500"></div>
+                  </div>
+                ) : uploadedFiles.length === 0 ? (
+                  <div className="bg-white rounded-lg shadow p-8 text-center">
+                    <div className="w-16 h-16 bg-gray-200 rounded-full mx-auto mb-4 flex items-center justify-center">
+                      <span className="text-2xl">📁</span>
+                    </div>
+                    <h3 className="text-lg font-semibold text-gray-700 mb-2">No Files Uploaded</h3>
+                    <p className="text-gray-500">Upload documents, templates, and other files for the placement process.</p>
+                  </div>
+                ) : (
+                  <div className="bg-white rounded-lg shadow overflow-hidden">
+                    <div className="px-6 py-4 bg-gray-50 border-b">
+                      <h2 className="text-lg font-semibold text-gray-800">Uploaded Files ({uploadedFiles.length})</h2>
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="min-w-full divide-y divide-gray-200">
+                        <thead className="bg-gray-50">
+                          <tr>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">File Name</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Category</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Size</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Modified</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                          </tr>
+                        </thead>
+                        <tbody className="bg-white divide-y divide-gray-200">
+                          {uploadedFiles.map((file, index) => {
+                            const fileCategory = file.name.split('/')[0] || 'uncategorized'
+                            const fileName = file.name.split('/').pop()
+                            const fileSize = file.metadata?.size 
+                              ? `${(file.metadata.size / 1024).toFixed(1)} KB`
+                              : 'Unknown'
+                            
+                            const categoryIcons = {
+                              'placement-docs': '📄',
+                              'templates': '📋',
+                              'reports': '📊',
+                              'guidelines': '📖',
+                              'company-info': '🏢'
+                            }
+
+                            return (
+                              <tr key={index} className="hover:bg-gray-50">
+                                <td className="px-6 py-4 whitespace-nowrap">
+                                  <div className="flex items-center">
+                                    <span className="text-2xl mr-3">
+                                      {categoryIcons[fileCategory] || '📄'}
+                                    </span>
+                                    <div>
+                                      <div className="text-sm font-medium text-gray-900">{fileName}</div>
+                                    </div>
+                                  </div>
+                                </td>
+                                <td className="px-6 py-4 whitespace-nowrap">
+                                  <span className="inline-flex px-2 py-1 text-xs font-semibold rounded-full bg-purple-100 text-purple-800">
+                                    {fileCategory.replace('-', ' ').replace(/\b\w/g, l => l.toUpperCase())}
+                                  </span>
+                                </td>
+                                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                                  {fileSize}
+                                </td>
+                                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                                  {file.updated_at ? new Date(file.updated_at).toLocaleDateString() : 'Unknown'}
+                                </td>
+                                <td className="px-6 py-4 whitespace-nowrap text-sm space-x-2">
+                                  <button
+                                    onClick={() => downloadFile(file.name)}
+                                    className="text-blue-600 hover:text-blue-900"
+                                  >
+                                    📥 Download
+                                  </button>
+                                  <button
+                                    onClick={() => deleteFile(file.name)}
+                                    className="text-red-600 hover:text-red-900"
+                                  >
+                                    🗑️ Delete
+                                  </button>
+                                </td>
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+
+                {/* File Categories Info */}
+                <div className="mt-8 bg-gray-50 rounded-lg p-6">
+                  <h3 className="text-lg font-semibold text-gray-800 mb-4">📁 File Categories</h3>
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    <div className="bg-white p-4 rounded-lg">
+                      <h4 className="font-medium text-gray-800 mb-2">📄 Placement Documents</h4>
+                      <p className="text-sm text-gray-600">Official documents, policies, and procedures</p>
+                    </div>
+                    <div className="bg-white p-4 rounded-lg">
+                      <h4 className="font-medium text-gray-800 mb-2">📋 Templates</h4>
+                      <p className="text-sm text-gray-600">Resume templates, application forms, and formats</p>
+                    </div>
+                    <div className="bg-white p-4 rounded-lg">
+                      <h4 className="font-medium text-gray-800 mb-2">📊 Reports</h4>
+                      <p className="text-sm text-gray-600">Placement statistics and analytics reports</p>
+                    </div>
+                    <div className="bg-white p-4 rounded-lg">
+                      <h4 className="font-medium text-gray-800 mb-2">📖 Guidelines</h4>
+                      <p className="text-sm text-gray-600">Student guidelines and preparation materials</p>
+                    </div>
+                    <div className="bg-white p-4 rounded-lg">
+                      <h4 className="font-medium text-gray-800 mb-2">🏢 Company Information</h4>
+                      <p className="text-sm text-gray-600">Company profiles and recruitment details</p>
+                    </div>
+                  </div>
                 </div>
               </div>
             )}
