@@ -1,0 +1,6 @@
+email,full_name,department,graduation_year,phone,skills
+john.doe@example.com,John Doe,Computer Science,2024,+1234567890,JavaScript;Python;React
+jane.smith@example.com,Jane Smith,Information Technology,2024,+1234567891,Java;Spring;MySQL
+bob.johnson@example.com,Bob Johnson,Electrical Engineering,2025,+1234567892,C++;Arduino;MATLAB
+alice.williams@example.com,Alice Williams,Computer Science,2023,+1234567893,Python;Django;PostgreSQL
+charlie.brown@example.com,Charlie Brown,Mechanical Engineering,2024,+1234567894,CAD;SolidWorks;3D Printing

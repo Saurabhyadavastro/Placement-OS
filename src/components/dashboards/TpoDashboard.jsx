@@ -4,7 +4,21 @@ import DashboardLayout from '../DashboardLayout'
 import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, LineChart, Line } from 'recharts'
 
 function TpoDashboard({ session, profile }) {
+  // Helper function to generate UUID
+  const generateUUID = () => {
+    if (crypto.randomUUID) {
+      return crypto.randomUUID()
+    }
+    // Fallback for older browsers
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+      const r = Math.random() * 16 | 0;
+      const v = c == 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+  }
+
   const [activeTab, setActiveTab] = useState('overview')
+  const [activeSubTab, setActiveSubTab] = useState('view-students') // For managing sub-tabs
   const [opportunities, setOpportunities] = useState([])
   const [loading, setLoading] = useState(false)
   const [message, setMessage] = useState('')
@@ -72,8 +86,16 @@ function TpoDashboard({ session, profile }) {
       fetchAllApplications()
     } else if (activeTab === 'students') {
       fetchStudents()
+      setActiveSubTab('view-students') // Reset to default sub-tab
     } else if (activeTab === 'files') {
       fetchFiles()
+    }
+  }, [activeTab])
+
+  // Reset sub-tab when changing main tabs
+  useEffect(() => {
+    if (activeTab !== 'students') {
+      setActiveSubTab('view-students')
     }
   }, [activeTab])
 
@@ -398,22 +420,38 @@ function TpoDashboard({ session, profile }) {
         return
       }
 
-      // Fetch student_profiles data
-      const studentIds = profiles?.map(p => p.id) || []
+      // Fetch student_profiles data for all students (including temp IDs)
       const { data: studentProfiles, error: studentProfilesError } = await supabase
         .from('student_profiles')
         .select('*')
-        .in('user_id', studentIds)
+        .order('created_at', { ascending: false })
 
       if (studentProfilesError) {
         console.error('Error fetching student details:', studentProfilesError)
       }
 
-      // Merge the data
+      // Merge the data - match by user_id in student_profiles with id in profiles
       const enrichedStudents = profiles?.map(profile => ({
         ...profile,
         student_profile: studentProfiles?.find(sp => sp.user_id === profile.id) || null
       })) || []
+
+      // Also include student profiles that might not have corresponding auth profiles (for temp users)
+      const orphanStudentProfiles = studentProfiles?.filter(sp => 
+        !profiles?.some(p => p.id === sp.user_id)
+      ) || []
+
+      // Add orphan profiles as temporary students
+      orphanStudentProfiles.forEach(sp => {
+        enrichedStudents.push({
+          id: sp.user_id,
+          email: sp.full_name ? `${sp.full_name.toLowerCase().replace(/\s+/g, '.')}@temp.edu` : 'unknown@temp.edu',
+          role: 'Student',
+          created_at: sp.created_at,
+          student_profile: sp,
+          isTemporary: true
+        })
+      })
 
       setStudents(enrichedStudents)
     } catch (error) {
@@ -430,23 +468,45 @@ function TpoDashboard({ session, profile }) {
     setMessage('')
 
     try {
-      // First, create the user account
-      const { data: authData, error: authError } = await supabase.auth.admin.createUser({
-        email: studentForm.email,
-        password: 'TempPassword123!', // Temporary password
-        email_confirm: true
-      })
-
-      if (authError) {
-        setMessage('Error creating student account: ' + authError.message)
+      // Validate required fields
+      if (!studentForm.email || !studentForm.full_name || !studentForm.department || !studentForm.graduation_year) {
+        setMessage('Please fill in all required fields (marked with *)')
+        setLoading(false)
         return
       }
 
-      // Create profile
+      // Validate email format
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+      if (!emailRegex.test(studentForm.email)) {
+        setMessage('Please enter a valid email address')
+        setLoading(false)
+        return
+      }
+
+      // Check if email already exists
+      const { data: existingProfile, error: checkError } = await supabase
+        .from('profiles')
+        .select('email')
+        .eq('email', studentForm.email)
+        .single()
+
+      if (existingProfile) {
+        setMessage('A student with this email already exists')
+        setLoading(false)
+        return
+      }
+
+      // For demo purposes, we'll create a student profile without auth
+      // In production, you'd integrate with proper user management
+      
+      // Generate a proper UUID for the user ID
+      const tempUserId = generateUUID()
+      
+      // Create profile entry
       const { error: profileError } = await supabase
         .from('profiles')
         .insert([{
-          id: authData.user.id,
+          id: tempUserId,
           email: studentForm.email,
           role: 'Student',
           created_at: new Date().toISOString()
@@ -461,7 +521,7 @@ function TpoDashboard({ session, profile }) {
       const { error: studentProfileError } = await supabase
         .from('student_profiles')
         .insert([{
-          user_id: authData.user.id,
+          user_id: tempUserId,
           full_name: studentForm.full_name,
           department: studentForm.department,
           graduation_year: parseInt(studentForm.graduation_year),
@@ -474,7 +534,7 @@ function TpoDashboard({ session, profile }) {
         return
       }
 
-      setMessage(`Student ${studentForm.full_name} added successfully! Temporary password: TempPassword123!`)
+      setMessage(`✅ Student ${studentForm.full_name} added successfully! They can register using email: ${studentForm.email}`)
       setStudentForm({
         email: '',
         full_name: '',
@@ -484,6 +544,9 @@ function TpoDashboard({ session, profile }) {
         skills: []
       })
       fetchStudents()
+      
+      // Return to main students view
+      setActiveSubTab('view-students')
     } catch (error) {
       setMessage('Error adding student: ' + error.message)
     } finally {
@@ -515,80 +578,121 @@ function TpoDashboard({ session, profile }) {
     setBulkUploadFile(file)
     setIsUploading(true)
     setUploadProgress(0)
+    setMessage('')
 
     try {
       const text = await file.text()
       const lines = text.split('\n').filter(line => line.trim())
-      const header = lines[0].split(',').map(h => h.trim())
+      
+      if (lines.length < 2) {
+        setMessage('CSV file must contain at least a header row and one data row')
+        return
+      }
+      
+      const header = lines[0].split(',').map(h => h.trim().toLowerCase())
       
       // Validate CSV format
       const requiredColumns = ['email', 'full_name', 'department', 'graduation_year']
-      const hasRequiredColumns = requiredColumns.every(col => 
-        header.some(h => h.toLowerCase().includes(col.toLowerCase()))
+      const missingColumns = requiredColumns.filter(col => 
+        !header.some(h => h.includes(col.toLowerCase().replace('_', '')))
       )
 
-      if (!hasRequiredColumns) {
-        setMessage('CSV must contain columns: email, full_name, department, graduation_year')
+      if (missingColumns.length > 0) {
+        setMessage(`CSV missing required columns: ${missingColumns.join(', ')}. Please check the format.`)
         return
       }
+
+      // Find column indices
+      const emailIndex = header.findIndex(h => h.includes('email'))
+      const nameIndex = header.findIndex(h => h.includes('name'))
+      const deptIndex = header.findIndex(h => h.includes('department'))
+      const yearIndex = header.findIndex(h => h.includes('year'))
+      const phoneIndex = header.findIndex(h => h.includes('phone'))
+      const skillsIndex = header.findIndex(h => h.includes('skill'))
 
       const students = []
       for (let i = 1; i < lines.length; i++) {
         const values = lines[i].split(',').map(v => v.trim())
         if (values.length >= 4) {
           const student = {
-            email: values[0],
-            full_name: values[1],
-            department: values[2],
-            graduation_year: values[3],
-            phone: values[4] || '',
-            skills: values[5] ? values[5].split(';').map(s => s.trim()) : []
+            email: values[emailIndex] || '',
+            full_name: values[nameIndex] || '',
+            department: values[deptIndex] || '',
+            graduation_year: values[yearIndex] || '',
+            phone: phoneIndex >= 0 ? values[phoneIndex] || '' : '',
+            skills: skillsIndex >= 0 && values[skillsIndex] 
+              ? values[skillsIndex].split(';').map(s => s.trim()).filter(s => s)
+              : []
           }
-          students.push(student)
+          
+          // Basic validation
+          if (student.email && student.full_name && student.department && student.graduation_year) {
+            students.push(student)
+          }
         }
-        setUploadProgress((i / lines.length) * 100)
+        setUploadProgress((i / lines.length) * 50) // First 50% for parsing
+      }
+
+      if (students.length === 0) {
+        setMessage('No valid student records found in CSV file')
+        return
       }
 
       // Process students in batches
       let successCount = 0
       let errorCount = 0
       
-      for (const student of students) {
+      for (let index = 0; index < students.length; index++) {
+        const student = students[index]
         try {
-          // Create user account
-          const { data: authData, error: authError } = await supabase.auth.admin.createUser({
-            email: student.email,
-            password: 'TempPassword123!',
-            email_confirm: true
-          })
-
-          if (!authError && authData.user) {
-            // Create profile
-            await supabase.from('profiles').insert([{
-              id: authData.user.id,
+          // Generate proper UUID for each student
+          const tempUserId = generateUUID()
+          
+          // Create profile
+          const { error: profileError } = await supabase
+            .from('profiles')
+            .insert([{
+              id: tempUserId,
               email: student.email,
-              role: 'Student'
+              role: 'Student',
+              created_at: new Date().toISOString()
             }])
 
+          if (!profileError) {
             // Create student profile
-            await supabase.from('student_profiles').insert([{
-              user_id: authData.user.id,
-              ...student,
-              graduation_year: parseInt(student.graduation_year)
-            }])
+            const { error: studentProfileError } = await supabase
+              .from('student_profiles')
+              .insert([{
+                user_id: tempUserId,
+                full_name: student.full_name,
+                department: student.department,
+                graduation_year: parseInt(student.graduation_year) || new Date().getFullYear(),
+                phone: student.phone,
+                skills: student.skills
+              }])
             
-            successCount++
+            if (!studentProfileError) {
+              successCount++
+            } else {
+              console.error('Student profile error:', studentProfileError)
+              errorCount++
+            }
           } else {
+            console.error('Profile error:', profileError)
             errorCount++
           }
         } catch (error) {
           console.error('Error processing student:', error)
           errorCount++
         }
+        
+        // Update progress (50% + 50% for processing)
+        setUploadProgress(50 + ((index + 1) / students.length) * 50)
       }
 
       setMessage(`Bulk upload completed! ${successCount} students added successfully, ${errorCount} errors.`)
       fetchStudents()
+      setActiveSubTab('view-students') // Return to main view
     } catch (error) {
       setMessage('Error processing CSV file: ' + error.message)
     } finally {
@@ -603,6 +707,7 @@ function TpoDashboard({ session, profile }) {
     try {
       setFilesLoading(true)
       
+      // Try to list files from the bucket
       const { data, error } = await supabase.storage
         .from('placement-files')
         .list('', {
@@ -611,28 +716,16 @@ function TpoDashboard({ session, profile }) {
         })
 
       if (error) {
-        // If bucket doesn't exist, create it
-        if (error.message.includes('not found')) {
-          const { error: bucketError } = await supabase.storage
-            .createBucket('placement-files', {
-              public: true,
-              allowedMimeTypes: ['application/pdf', 'image/*', 'text/*', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document']
-            })
-          
-          if (bucketError) {
-            setMessage('Error creating storage bucket: ' + bucketError.message)
-          } else {
-            setUploadedFiles([])
-          }
-        } else {
-          setMessage('Error loading files: ' + error.message)
-        }
+        // If bucket doesn't exist, try to create it (this might fail due to RLS)
+        console.log('Files bucket not found, files feature may require manual setup')
+        setUploadedFiles([])
+        setMessage('File storage not configured. Files feature requires admin setup.')
       } else {
         setUploadedFiles(data || [])
       }
     } catch (error) {
       console.error('Error:', error)
-      setMessage('Error loading files: ' + error.message)
+      setUploadedFiles([])
     } finally {
       setFilesLoading(false)
     }
@@ -646,15 +739,34 @@ function TpoDashboard({ session, profile }) {
     setMessage('')
 
     try {
-      const fileExt = file.name.split('.').pop()
-      const fileName = `${fileCategory}/${Date.now()}_${file.name}`
+      const fileName = `${fileCategory}/${Date.now()}_${file.name.replace(/[^a-zA-Z0-9.-]/g, '_')}`
 
+      // Try to upload to placement-files bucket
       const { data, error } = await supabase.storage
         .from('placement-files')
-        .upload(fileName, file)
+        .upload(fileName, file, {
+          cacheControl: '3600',
+          upsert: false
+        })
 
       if (error) {
-        setMessage('Error uploading file: ' + error.message)
+        // If upload fails, try resumes bucket as fallback
+        const fallbackName = `${Date.now()}_${file.name.replace(/[^a-zA-Z0-9.-]/g, '_')}`
+        const { data: fallbackData, error: fallbackError } = await supabase.storage
+          .from('resumes')
+          .upload(fallbackName, file, {
+            cacheControl: '3600',
+            upsert: false
+          })
+
+        if (fallbackError) {
+          setMessage('Error uploading file: ' + fallbackError.message)
+        } else {
+          setMessage(`File "${file.name}" uploaded successfully to temporary storage!`)
+          setSelectedFile(null)
+          setFileDescription('')
+          fetchFiles()
+        }
       } else {
         setMessage(`File "${file.name}" uploaded successfully!`)
         setSelectedFile(null)
@@ -1494,6 +1606,28 @@ function TpoDashboard({ session, profile }) {
               <div>
                 <h1 className="text-3xl font-bold text-gray-900 mb-8">Student Management</h1>
                 
+                {/* Debug Information */}
+                <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6">
+                  <h3 className="font-semibold text-blue-800 mb-2">🐛 Debug Information</h3>
+                  <div className="text-sm text-blue-700">
+                    <p>Active Tab: {activeTab}</p>
+                    <p>Active Sub-Tab: {activeSubTab}</p>
+                    <p>Students Count: {students.length}</p>
+                    <p>Loading: {studentsLoading ? 'Yes' : 'No'}</p>
+                    <p>Session User ID: {session?.user?.id}</p>
+                    <button 
+                      onClick={() => {
+                        console.log('Students:', students)
+                        console.log('Active Sub-Tab:', activeSubTab)
+                        fetchStudents()
+                      }}
+                      className="mt-2 bg-blue-200 hover:bg-blue-300 px-3 py-1 rounded text-blue-800"
+                    >
+                      🔄 Refresh & Debug
+                    </button>
+                  </div>
+                </div>
+                
                 {/* Student Statistics */}
                 <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
                   <div className="bg-white p-6 rounded-lg shadow">
@@ -1527,9 +1661,9 @@ function TpoDashboard({ session, profile }) {
                       {['view-students', 'add-student', 'bulk-upload'].map((tab) => (
                         <button
                           key={tab}
-                          onClick={() => setActiveTab(`students-${tab}`)}
+                          onClick={() => setActiveSubTab(tab)}
                           className={`py-4 px-1 border-b-2 font-medium text-sm ${
-                            activeTab === `students-${tab}`
+                            activeSubTab === tab
                               ? 'border-purple-500 text-purple-600'
                               : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
                           }`}
@@ -1544,7 +1678,7 @@ function TpoDashboard({ session, profile }) {
                 </div>
 
                 {/* Student List */}
-                {(activeTab === 'students' || activeTab === 'students-view-students') && (
+                {activeSubTab === 'view-students' && (
                   <div>
                     {studentsLoading ? (
                       <div className="flex justify-center py-8">
@@ -1558,7 +1692,7 @@ function TpoDashboard({ session, profile }) {
                         <h3 className="text-lg font-semibold text-gray-700 mb-2">No Students Found</h3>
                         <p className="text-gray-500 mb-4">Start by adding students to the system.</p>
                         <button
-                          onClick={() => setActiveTab('students-add-student')}
+                          onClick={() => setActiveSubTab('add-student')}
                           className="bg-purple-500 text-white px-6 py-2 rounded-md hover:bg-purple-600"
                         >
                           Add First Student
@@ -1640,7 +1774,7 @@ function TpoDashboard({ session, profile }) {
                 )}
 
                 {/* Add Student Form */}
-                {activeTab === 'students-add-student' && (
+                {activeSubTab === 'add-student' && (
                   <div className="bg-white rounded-lg shadow p-6">
                     <h2 className="text-xl font-bold text-gray-900 mb-6">Add New Student</h2>
                     
@@ -1780,7 +1914,7 @@ function TpoDashboard({ session, profile }) {
                       <div className="flex justify-end space-x-4">
                         <button
                           type="button"
-                          onClick={() => setActiveTab('students')}
+                          onClick={() => setActiveSubTab('view-students')}
                           className="px-6 py-3 border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50"
                         >
                           Cancel
@@ -1798,7 +1932,7 @@ function TpoDashboard({ session, profile }) {
                 )}
 
                 {/* Bulk Upload */}
-                {activeTab === 'students-bulk-upload' && (
+                {activeSubTab === 'bulk-upload' && (
                   <div className="bg-white rounded-lg shadow p-6">
                     <h2 className="text-xl font-bold text-gray-900 mb-6">Bulk Upload Students</h2>
                     
@@ -1861,7 +1995,7 @@ function TpoDashboard({ session, profile }) {
                           📥 Download Sample CSV
                         </button>
                         <button
-                          onClick={() => setActiveTab('students')}
+                          onClick={() => setActiveSubTab('view-students')}
                           className="px-6 py-3 border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50"
                         >
                           Back to Students
